@@ -24,7 +24,7 @@ with mlflow.start_run() as run:
     mlflow.log_metric("accuracy", accuracy)
     mlflow.sklearn.log_model(model, "model")
 a
-    print(f"Accuracy: {0.70}")
+    print(f"Accuracy: {accuracy}")
     print(f"Run ID: {run.info.run_id}")
 
     with open("model_info.txt", "w") as f:
