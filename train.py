@@ -21,9 +21,9 @@ with mlflow.start_run() as run:
     accuracy = accuracy_score(y_test, model.predict(X_test))
 
     mlflow.log_param("n_estimators", 100)
-    mlflow.log_metric("accuracy", 0.70)
+    mlflow.log_metric("accuracy", accuracy)
     mlflow.sklearn.log_model(model, "model")
-
+a
     print(f"Accuracy: {0.70}")
     print(f"Run ID: {run.info.run_id}")
 
