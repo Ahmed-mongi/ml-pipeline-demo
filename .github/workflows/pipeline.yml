@@ -1,15 +1,65 @@
-name: ML Validation and Deployment Pipeline
+name: Gatekeeper ML Pipeline
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches:
+      - "**"          # Trigger on ALL branch pushes so the linter always runs
+                      # but the train job will self-filter to main only
 
+# ─────────────────────────────────────────────────────────────
+# JOB 1: LINTER  (cheap, always runs, no GPU needed)
+# This is the gatekeeper's first check.
+# If this fails, the train job never even starts.
+# ─────────────────────────────────────────────────────────────
 jobs:
-
-  validate:
-    name: Train & Validate Model
+  linter:
+    name: Code Quality Check
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install linter
+        run: pip install flake8
+
+      - name: Run flake8 linter
+        # If any lint errors exist, this step exits with code 1
+        # which fails the linter job and blocks the train job
+        run: flake8 . --max-line-length=120 --exclude=venv,.git
+
+# ─────────────────────────────────────────────────────────────
+# JOB 2: TRAIN  (expensive GPU job — the protected resource)
+#
+# THREE CONDITIONS must ALL be true for this job to run:
+#
+#   1. needs: linter         → linter job must pass first
+#   2. github.ref == ...main → must be on the main branch
+#   3. contains(commit msg)  → commit message must have [run-train]
+#
+# If ANY of the three conditions is false → job is SKIPPED
+# A skipped job shows as grey in the GitHub Actions UI (not red)
+# ─────────────────────────────────────────────────────────────
+  train:
+    name: GPU Model Training
+    runs-on: ubuntu-latest   # swap to a GPU runner in production
+                             # e.g. runs-on: [self-hosted, gpu]
+
+    needs: linter            # CONDITION 1: linter job must succeed
+
+    # CONDITION 2 + 3 combined in one if: expression
+    # github.ref == 'refs/heads/main'        → branch must be main
+    # contains(github.event.head_commit.message, '[run-train]')
+    #                                        → commit message must contain [run-train]
+    # Both must be true → use && (and)
+    if: |
+      github.ref == 'refs/heads/main' &&
+      contains(github.event.head_commit.message, '[run-train]')
 
     steps:
       - name: Checkout repository
@@ -23,72 +73,48 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate sample data (no DVC remote needed)
-        run: |
-          python -c "
-          from sklearn.datasets import load_iris
-          import pandas as pd, os
-          os.makedirs('data', exist_ok=True)
-          X, y = load_iris(return_X_y=True, as_frame=True)
-          import pandas as pd
-          pd.concat([X, y], axis=1).to_csv('data/iris.csv', index=False)
-          print('Data ready')
-          "
-
-      - name: Train model and log to MLflow
+      # ── MAIN TRAINING STEP ──────────────────────────────────
+      - name: Run model training
         env:
           MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
           MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
           MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
         run: python train.py
 
-      - name: Verify model_info.txt was created
+      # ── ON FAILURE: collect and upload error logs ────────────
+      # if: failure() means this step ONLY runs when a previous
+      # step in this job has failed. On success it is skipped.
+      - name: Collect error logs
+        if: failure()
         run: |
-          if [ ! -f model_info.txt ]; then
-            echo "ERROR: model_info.txt not found"
-            exit 1
+          echo "=== Training failed at $(date) ===" > error_logs.txt
+          echo "Branch: ${{ github.ref }}" >> error_logs.txt
+          echo "Commit: ${{ github.sha }}" >> error_logs.txt
+          echo "Commit message: ${{ github.event.head_commit.message }}" >> error_logs.txt
+          echo "Triggered by: ${{ github.actor }}" >> error_logs.txt
+          echo "" >> error_logs.txt
+          echo "=== Last 50 lines of Python traceback (if any) ===" >> error_logs.txt
+          # Capture any crash output written to a log file
+          # (train.py should redirect stderr to train_output.log)
+          if [ -f train_output.log ]; then
+            tail -50 train_output.log >> error_logs.txt
+          else
+            echo "No train_output.log found." >> error_logs.txt
           fi
-          echo "Run ID: $(cat model_info.txt)"
 
-      - name: Upload model_info artifact
+      - name: Upload error logs as artifact
+        # This also only runs on failure — no point uploading if training passed
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: model-info
-          path: model_info.txt
-          retention-days: 7
+          name: error-logs
+          path: error_logs.txt
+          retention-days: 14   # keep for 14 days so devs can investigate
 
-  deploy:
-    name: Check Threshold & Deploy
-    runs-on: ubuntu-latest
-    needs: validate
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install dependencies
-        run: pip install mlflow
-
-      - name: Download model_info artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: model-info
-
-      - name: Show downloaded Run ID
-        run: echo "Run ID is $(cat model_info.txt)"
-
-      - name: Check accuracy threshold
-        env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
-          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
-        run: python check_threshold.py
-
-      - name: Mock Docker build
-        run: |
-          echo "Building Docker image for Run ID: $(cat model_info.txt)"
+      # ── ALWAYS: cleanup step ─────────────────────────────────
+      # if: always() means this step runs NO MATTER WHAT —
+      # whether training passed, failed, or was cancelled.
+      # This is where you release cloud resources, volumes, etc.
+      - name: Cleanup temporary cloud volumes
+        if: always()
+        run: echo "Cleaning up temporary cloud volumes..."
